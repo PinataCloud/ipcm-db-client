@@ -60,6 +60,10 @@ export default function Database() {
 
       if (!manifestCid) {
         // No version exists yet, create new database
+        // First clear any existing databases to avoid conflicts
+        await clearDatabase("todo-db");
+        await clearDatabase("/pglite/todo-db");
+
         db = new PGlite({
           dataDir: "idb://todo-db",
         });
@@ -74,18 +78,23 @@ export default function Database() {
       const remoteManifest = manifestResponse.data as unknown as DbVersionManifest;
       console.log("Remote manifest:", remoteManifest);
 
-
       // Fetch the remote database file
       const dbFileResponse = await pinata.gateways.public.get(remoteManifest.cid);
       const dbFile = dbFileResponse.data as Blob;
 
-      // Check if we have a local database and version
-      const dbExists = await checkDatabaseExists("todo-db");
+      // Check if we have a local database (check both possible paths)
+      const dbExistsMain = await checkDatabaseExists("todo-db");
+      const dbExistsAlt = await checkDatabaseExists("/pglite/todo-db");
+      const dbExists = dbExistsMain || dbExistsAlt;
+
+      console.log("Database existence check:", { main: dbExistsMain, alt: dbExistsAlt });
+
       const localVersion = await getLocalVersion();
 
       // Simple conflict resolution based on blockchain timestamp
       if (!dbExists) {
         // No local DB, use remote
+        console.log("No local database found, creating from remote");
         db = new PGlite({
           loadDataDir: dbFile,
           dataDir: "idb://todo-db",
@@ -94,13 +103,27 @@ export default function Database() {
         await saveLocalVersion(remoteManifest);
         setHasLocalChanges(false);
       } else if (!localVersion) {
-        // We have local DB but no version info - mark as having local changes
+        // We have local DB but no version info - clean up both possible DBs to avoid conflicts
+        console.log("Local database found but no version info, clearing databases");
+        await clearDatabase("todo-db");
+        await clearDatabase("/pglite/todo-db");
+
+        // Create from remote instead
         db = new PGlite({
+          loadDataDir: dbFile,
           dataDir: "idb://todo-db",
         });
-        setHasLocalChanges(true);
+        setCurrentVersion(remoteManifest);
+        await saveLocalVersion(remoteManifest);
+        setHasLocalChanges(false);
       } else if (localVersion.cid === remoteManifest.cid) {
-        // Same version, use local
+        // Same version, use local but ensure we're using the right path
+        console.log("Local version matches remote, using local");
+        // Clear alt path if it exists to prevent conflicts
+        if (dbExistsAlt) {
+          await clearDatabase("/pglite/todo-db");
+        }
+
         db = new PGlite({
           dataDir: "idb://todo-db",
         });
@@ -111,8 +134,11 @@ export default function Database() {
         const useRemote = remoteManifest.blockTimestamp > (localVersion.blockTimestamp || 0);
 
         if (useRemote) {
-          // Use remote version
+          // Use remote version - clear both paths first
+          console.log("Remote version is newer, clearing both DBs");
           await clearDatabase("todo-db");
+          await clearDatabase("/pglite/todo-db");
+
           db = new PGlite({
             loadDataDir: dbFile,
             dataDir: "idb://todo-db",
@@ -122,7 +148,13 @@ export default function Database() {
           setHasLocalChanges(false);
           toast("Using newer remote version");
         } else {
-          // Keep local version
+          // Keep local version but ensure we're using the right path
+          console.log("Local version is newer, using local");
+          // Clear alt path if it exists to prevent conflicts
+          if (dbExistsAlt) {
+            await clearDatabase("/pglite/todo-db");
+          }
+
           db = new PGlite({
             dataDir: "idb://todo-db",
           });
@@ -142,7 +174,11 @@ export default function Database() {
       toast.error("Failed to import database");
 
       // In case of error, create a new empty database
+      // Clear both potential database paths first
       try {
+        await clearDatabase("todo-db");
+        await clearDatabase("/pglite/todo-db");
+
         db = new PGlite({
           dataDir: "idb://todo-db",
         });
