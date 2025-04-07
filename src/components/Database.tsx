@@ -4,16 +4,15 @@ import { useState, useEffect } from "react";
 import { Input } from "./ui/input";
 import { Checkbox } from "./ui/checkbox";
 import { publicClient, pinata } from "@/utils/config";
-import { abi } from "@/utils/contract"
+import { abi } from "@/utils/contract";
 import { createVersionManifest, DbVersionManifest } from "@/utils/dbVersioning";
-import { checkDatabaseExists } from "@/utils/db";
-import { Loader2 } from "lucide-react"
-import { toast } from "sonner"
+import { checkDatabaseExists, clearDatabase, getLocalVersion, saveLocalVersion } from "@/utils/db";
+import { Loader2 } from "lucide-react";
+import { toast } from "sonner";
 import { createWalletClient, custom } from "viem";
 import { baseSepolia } from "viem/chains";
-import 'viem/window';
 import { uploadFile } from "@/utils/uploads";
-
+import "viem/window"
 
 let db: PGlite | undefined;
 
@@ -28,7 +27,8 @@ export default function Database() {
   const [taskName, setTaskName] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [currentVersion, setCurrentVersion] = useState<string | null>(null);
+  const [currentVersion, setCurrentVersion] = useState<DbVersionManifest | null>(null);
+  const [hasLocalChanges, setHasLocalChanges] = useState(false);
 
   async function initializeDb() {
     try {
@@ -58,44 +58,84 @@ export default function Database() {
         functionName: "getMapping",
       }) as string;
 
-      // Fetch the manifest
-      const manifestResponse = await pinata.gateways.public.get(manifestCid);
-      const manifest = manifestResponse.data as unknown as DbVersionManifest;
-      console.log(manifest)
-
-      setCurrentVersion(manifestCid);
-
-      // Fetch the actual database file
-      const dbFile = await pinata.gateways.public.get(manifest.cid);
-      const file = dbFile.data as Blob;
-      console.log(file)
-
-      // Load database
-      const dbExists = await checkDatabaseExists("todo-db");
-      if (!dbExists) {
-        db = new PGlite({
-          loadDataDir: file,
-          dataDir: "idb://todo-db",
-        });
-        console.log("Used remote db");
-      } else {
-        // Check for local modifications and compare timestamps
-        // This would require additional logic to handle conflicts
+      if (!manifestCid) {
+        // No version exists yet, create new database
         db = new PGlite({
           dataDir: "idb://todo-db",
         });
-        console.log("Used local db");
+        await initializeDb();
+        setTodos([]);
+        setLoading(false);
+        return;
       }
 
-      // Initialize database structure if needed
+      // Fetch the manifest
+      const manifestResponse = await pinata.gateways.public.get(manifestCid);
+      const remoteManifest = manifestResponse.data as unknown as DbVersionManifest;
+      console.log("Remote manifest:", remoteManifest);
+
+
+      // Fetch the remote database file
+      const dbFileResponse = await pinata.gateways.public.get(remoteManifest.cid);
+      const dbFile = dbFileResponse.data as Blob;
+
+      // Check if we have a local database and version
+      const dbExists = await checkDatabaseExists("todo-db");
+      const localVersion = await getLocalVersion();
+
+      // Simple conflict resolution based on blockchain timestamp
+      if (!dbExists) {
+        // No local DB, use remote
+        db = new PGlite({
+          loadDataDir: dbFile,
+          dataDir: "idb://todo-db",
+        });
+        setCurrentVersion(remoteManifest);
+        await saveLocalVersion(remoteManifest);
+        setHasLocalChanges(false);
+      } else if (!localVersion) {
+        // We have local DB but no version info - mark as having local changes
+        db = new PGlite({
+          dataDir: "idb://todo-db",
+        });
+        setHasLocalChanges(true);
+      } else if (localVersion.cid === remoteManifest.cid) {
+        // Same version, use local
+        db = new PGlite({
+          dataDir: "idb://todo-db",
+        });
+        setCurrentVersion(localVersion);
+        setHasLocalChanges(false);
+      } else {
+        // Conflict resolution based on timestamp
+        const useRemote = remoteManifest.blockTimestamp > (localVersion.blockTimestamp || 0);
+
+        if (useRemote) {
+          // Use remote version
+          await clearDatabase("todo-db");
+          db = new PGlite({
+            loadDataDir: dbFile,
+            dataDir: "idb://todo-db",
+          });
+          setCurrentVersion(remoteManifest);
+          await saveLocalVersion(remoteManifest);
+          setHasLocalChanges(false);
+          toast("Using newer remote version");
+        } else {
+          // Keep local version
+          db = new PGlite({
+            dataDir: "idb://todo-db",
+          });
+          setCurrentVersion(localVersion);
+          setHasLocalChanges(true);
+          toast("Using local version");
+        }
+      }
+
       await initializeDb();
-
-      // Now query the todo table
-      const ret = await db?.query(`SELECT * from todo ORDER BY id ASC;`);
-      setTodos(ret?.rows as ToDo[] || []);
-
-      toast("Database Restored");
+      await loadTodos();
       setLoading(false);
+      toast("Database Loaded");
     } catch (error) {
       setLoading(false);
       console.error("Error importing database:", error);
@@ -108,10 +148,16 @@ export default function Database() {
         });
         await initializeDb();
         setTodos([]);
+        setHasLocalChanges(false);
       } catch (fallbackError) {
         console.error("Failed to create fallback database:", fallbackError);
       }
     }
+  }
+
+  async function loadTodos() {
+    const ret = await db?.query(`SELECT * from todo ORDER BY id ASC;`);
+    setTodos(ret?.rows as ToDo[] || []);
   }
 
   async function addTodo() {
@@ -119,12 +165,9 @@ export default function Database() {
       await db?.query("INSERT INTO todo (task, done) VALUES ($1, false)", [
         taskName,
       ]);
-      const ret = await db?.query(`
-        SELECT * from todo ORDER BY id ASC;
-      `);
-      setTodos(ret?.rows as ToDo[]);
+      await loadTodos();
       setTaskName("");
-      console.log(ret?.rows);
+      setHasLocalChanges(true);
     } catch (error) {
       console.log(error);
       toast.error("Failed to add todo");
@@ -134,8 +177,8 @@ export default function Database() {
   async function updateTodo(id: number, done: boolean) {
     try {
       await db?.query("UPDATE todo SET done = $1 WHERE id = $2", [done, id]);
-      const ret = await db?.query("SELECT * from todo ORDER BY ID ASC;");
-      setTodos(ret?.rows as ToDo[]);
+      await loadTodos();
+      setHasLocalChanges(true);
     } catch (error) {
       console.log(error);
       toast.error("Failed to update todo");
@@ -145,8 +188,8 @@ export default function Database() {
   async function deleteTodo(id: number) {
     try {
       await db?.query("DELETE FROM todo WHERE id = $1", [id]);
-      const ret = await db?.query("SELECT * from todo ORDER BY ID ASC;");
-      setTodos(ret?.rows as ToDo[]);
+      await loadTodos();
+      setHasLocalChanges(true);
     } catch (error) {
       console.log(error);
       toast.error("Failed to delete todo");
@@ -175,12 +218,15 @@ export default function Database() {
         return;
       }
 
+      // Dump database to file
       const dbFile = await db?.dumpDataDir("auto");
 
+      // Upload database file to IPFS
       const dbCid = await uploadFile(dbFile as File);
 
-      // Create version manifest with blockchain timestamp
-      const manifest = await createVersionManifest(dbCid, currentVersion);
+      // Create version manifest, referencing previous version if exists
+      const prevCid = currentVersion?.cid || null;
+      const manifest = await createVersionManifest(dbCid, prevCid);
 
       // Upload manifest to IPFS
       const manifestCid = await uploadFile(manifest);
@@ -198,7 +244,9 @@ export default function Database() {
       await publicClient.waitForTransactionReceipt({ hash: tx });
 
       // Update local state
-      setCurrentVersion(manifestCid);
+      setCurrentVersion(manifest);
+      await saveLocalVersion(manifest);
+      setHasLocalChanges(false);
 
       toast("Database Saved");
       setSaving(false);
@@ -223,10 +271,21 @@ export default function Database() {
         <Loader2 className="h-12 w-12 animate-spin" />
       ) : (
         <>
+          <div className="flex flex-col gap-2 items-center mb-4">
+            <div className="text-sm text-muted-foreground">
+              {hasLocalChanges ? (
+                <span className="text-amber-500">You have unsaved local changes</span>
+              ) : (
+                <span className="text-green-500">Database is up to date</span>
+              )}
+            </div>
+          </div>
+
           <div className="flex flex-row items-center gap-4">
             <Input value={taskName} onChange={taskNameHandle} type="text" placeholder="Enter a task" />
             <Button onClick={addTodo} disabled={!taskName.trim()}>Add Todo</Button>
           </div>
+
           <div className="flex flex-col gap-2 items-start">
             {todos && todos.length > 0 ? (
               todos.map((item: ToDo) => (
@@ -258,6 +317,7 @@ export default function Database() {
               <p>No todos yet</p>
             )}
           </div>
+
           <div className="w-full">
             {saving ? (
               <Button className="w-full" disabled>
@@ -265,8 +325,12 @@ export default function Database() {
                 Saving...
               </Button>
             ) : (
-              <Button className="w-full" onClick={saveDb}>
-                Save
+              <Button
+                className="w-full"
+                onClick={saveDb}
+                variant={hasLocalChanges ? "default" : "outline"}
+              >
+                {hasLocalChanges ? "Save Changes" : "Save"}
               </Button>
             )}
           </div>

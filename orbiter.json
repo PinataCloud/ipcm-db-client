@@ -1,0 +1,6 @@
+{
+  "domain": "ipcm-db",
+  "buildCommand": "bun run build",
+  "buildDir": "dist",
+  "siteId": "35369f4a-beb2-4525-8971-01bce5e431e6"
+}
